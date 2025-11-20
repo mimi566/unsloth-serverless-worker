@@ -36,6 +36,18 @@
       {
         "key": "MODEL_NAME",
         "value": "HuggingFaceTB/SmolLM2-135M-Instruct"
+      },
+      {
+        "key": "TOKENIZER_NAME",
+        "value": ""
+      },
+      {
+        "key": "HF_TOKEN",
+        "value": ""
+      },
+      {
+        "key": "QUANTIZATION",
+        "value": "None"
       }
     ],
     "allowedCudaVersions": ["12.9", "12.8", "12.7", "12.6", "12.5"]

@@ -1,50 +1,70 @@
-FROM nvidia/cuda:12.1.0-base-ubuntu22.04 
+# ================================
+# Base Image: CUDA 12.1 + Ubuntu
+# ================================
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
 
-RUN apt-get update -y \
-    && apt-get install -y python3-pip
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 
-RUN ldconfig /usr/local/cuda-12.1/compat/
+# ================================
+# System Dependencies
+# ================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv git wget curl build-essential \
+    libssl-dev libsndfile1 libglib2.0-0 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY builder/requirements.txt /requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --upgrade pip && \
-    python3 -m pip install --upgrade -r /requirements.txt
+RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# Install vLLM (switching back to pip installs since issues that required building fork are fixed and space optimization is not as important since caching) and FlashInfer 
-RUN python3 -m pip install vllm==0.11.0 && \
-    python3 -m pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3
+# ================================
+# Install PyTorch (CUDA 12.1 build)
+# ================================
+RUN python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu121
 
-# Setup for Option 2: Building the Image with the Model included
-ARG MODEL_NAME=""
-ARG TOKENIZER_NAME=""
-ARG BASE_PATH="/runpod-volume"
-ARG QUANTIZATION=""
-ARG MODEL_REVISION=""
-ARG TOKENIZER_REVISION=""
+# ================================
+# Install Unsloth + Transformers Stack
+# ================================
+RUN python3 -m pip install \
+    unsloth \
+    transformers \
+    accelerate \
+    bitsandbytes \
+    sentencepiece \
+    safetensors \
+    fastapi \
+    uvicorn[standard] \
+    sse-starlette
 
-ENV MODEL_NAME=$MODEL_NAME \
-    MODEL_REVISION=$MODEL_REVISION \
-    TOKENIZER_NAME=$TOKENIZER_NAME \
-    TOKENIZER_REVISION=$TOKENIZER_REVISION \
-    BASE_PATH=$BASE_PATH \
-    QUANTIZATION=$QUANTIZATION \
-    HF_DATASETS_CACHE="${BASE_PATH}/huggingface-cache/datasets" \
-    HUGGINGFACE_HUB_CACHE="${BASE_PATH}/huggingface-cache/hub" \
-    HF_HOME="${BASE_PATH}/huggingface-cache/hub" \
-    HF_HUB_ENABLE_HF_TRANSFER=0 
+# ================================
+# Environment Variables
+# ================================
+ENV MODEL_NAME="Sourabh66/Llama-2-17B-Fine-Tune-Blog" \
+    MAX_SEQ_LENGTH=32768 \
+    MODEL_CACHE_DIR="/models" \
+    HF_TOKEN="" \
+    PYTHONPATH="/app"
 
-ENV PYTHONPATH="/:/vllm-workspace"
+# ================================
+# Copy App Files
+# ================================
+WORKDIR /app
+COPY src /app/src
+COPY server.py /app/server.py
+COPY runpod_handler.py /app/runpod_handler.py
 
+# ================================
+# (Optional) Model Baking
+# ================================
+# COPY ./models /models
 
-COPY src /src
-RUN --mount=type=secret,id=HF_TOKEN,required=false \
-    if [ -f /run/secrets/HF_TOKEN ]; then \
-    export HF_TOKEN=$(cat /run/secrets/HF_TOKEN); \
-    fi && \
-    if [ -n "$MODEL_NAME" ]; then \
-    python3 /src/download_model.py; \
-    fi
+# ================================
+# Expose Port
+# ================================
+EXPOSE 8080
 
-# Start the handler
-CMD ["python3", "/src/handler.py"]
+# ================================
+# Start API Server
+# ================================
+CMD ["python3", "server.py"]

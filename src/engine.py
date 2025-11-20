@@ -1,306 +1,262 @@
+# src/engine.py
 import os
 import logging
 import json
 import asyncio
-
-from dotenv import load_dotenv
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Dict, Any, List
 import time
 
-from vllm import AsyncLLMEngine
-from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, CompletionRequest, ErrorResponse
-from vllm.entrypoints.openai.serving_models import BaseModelPath, LoRAModulePath, OpenAIServingModels
-
+from unsloth import FastLanguageModel
+from transformers import TextStreamer, AutoTokenizer
 
 from utils import DummyRequest, JobInput, BatchSize, create_error_response
-from constants import DEFAULT_MAX_CONCURRENCY, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_SIZE_GROWTH_FACTOR, DEFAULT_MIN_BATCH_SIZE
 from tokenizer import TokenizerWrapper
-from engine_args import get_engine_args
 
-class vLLMEngine:
-    def __init__(self, engine = None):
-        load_dotenv() # For local development
-        self.engine_args = get_engine_args()
-        logging.info(f"Engine args: {self.engine_args}")
-        
-        # Initialize vLLM engine first
-        self.llm = self._initialize_llm() if engine is None else engine.llm
-        
-        # Only create custom tokenizer wrapper if not using mistral tokenizer mode
-        # For mistral models, let vLLM handle tokenizer initialization
-        if self.engine_args.tokenizer_mode != 'mistral':
-            self.tokenizer = TokenizerWrapper(self.engine_args.tokenizer or self.engine_args.model, 
-                                              self.engine_args.tokenizer_revision, 
-                                              self.engine_args.trust_remote_code)
-        else:
-            # For mistral models, we'll get the tokenizer from vLLM later
-            self.tokenizer = None
-            
-        self.max_concurrency = int(os.getenv("MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY))
-        self.default_batch_size = int(os.getenv("DEFAULT_BATCH_SIZE", DEFAULT_BATCH_SIZE))
-        self.batch_size_growth_factor = int(os.getenv("BATCH_SIZE_GROWTH_FACTOR", DEFAULT_BATCH_SIZE_GROWTH_FACTOR))
-        self.min_batch_size = int(os.getenv("MIN_BATCH_SIZE", DEFAULT_MIN_BATCH_SIZE))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("engine")
 
-    def _get_tokenizer_for_chat_template(self):
-        """Get tokenizer for chat template application"""
-        if self.tokenizer is not None:
-            return self.tokenizer
-        else:
-            # For mistral models, get tokenizer from vLLM engine
-            # This is a fallback - ideally chat templates should be handled by vLLM directly
+# Environment-driven config (with sensible defaults)
+MODEL_NAME = os.getenv("MODEL_NAME", "Sourabh66/Llama-2-17B-Fine-Tune-Blog")
+MAX_SEQ_LENGTH = int(os.getenv("MAX_SEQ_LENGTH", "32768"))
+MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", None)
+HF_TOKEN = os.getenv("HF_TOKEN", None)
+CHUNK_MAX_WORDS = int(os.getenv("CHUNK_MAX_WORDS", "2500"))
+CHUNK_OVERLAP_WORDS = int(os.getenv("CHUNK_OVERLAP_WORDS", "50"))
+
+
+def split_text_into_chunks(text: str, max_words: int = CHUNK_MAX_WORDS, overlap_words: int = CHUNK_OVERLAP_WORDS):
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+    chunks = []
+    i = 0
+    n = len(words)
+    while i < n:
+        chunk = words[i:i + max_words]
+        chunks.append(" ".join(chunk))
+        i += max_words - overlap_words
+    return chunks
+
+
+class UnslothEngine:
+    """
+    Simple Unsloth-based engine that loads FastLanguageModel once
+    and exposes an async generator `generate(job_input)` that yields dicts.
+    """
+
+    def __init__(self):
+        start = time.time()
+        logger.info(f"Initializing UnslothEngine with model={MODEL_NAME} cache_dir={MODEL_CACHE_DIR}")
+        # Load model + tokenizer via Unsloth helper
+        try:
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name=MODEL_NAME,
+                max_seq_length=MAX_SEQ_LENGTH,
+                dtype=None,
+                load_in_4bit=True,
+                cache_dir=MODEL_CACHE_DIR if MODEL_CACHE_DIR and os.path.exists(MODEL_CACHE_DIR) else None,
+                use_auth_token=HF_TOKEN if HF_TOKEN else None,
+            )
+            # Try enabling inference optimizations
             try:
-                from transformers import AutoTokenizer
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.engine_args.tokenizer or self.engine_args.model,
-                    revision=self.engine_args.tokenizer_revision or "main",
-                    trust_remote_code=self.engine_args.trust_remote_code
-                )
-                # Create a minimal wrapper
-                class MinimalTokenizerWrapper:
+                FastLanguageModel.for_inference(self.model)
+            except Exception as e:
+                logger.info(f"for_inference() skipped/failed: {e}")
+        except Exception as e:
+            logger.exception("Failed to load model")
+            raise e
+        end = time.time()
+        logger.info(f"Loaded Unsloth model in {end - start:.2f}s")
+        # Wrap tokenizer with TokenizerWrapper if possible (some models already have chat template)
+        try:
+            # TokenizerWrapper expects tokenizer name and revision; we try to detect name from env
+            self.tokenizer_wrapper = TokenizerWrapper(MODEL_NAME, None, True)
+        except Exception:
+            # Fallback minimal wrapper using transformers' AutoTokenizer
+            try:
+                hf_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+                class MinimalWrapper:
                     def __init__(self, tokenizer):
                         self.tokenizer = tokenizer
                         self.custom_chat_template = os.getenv("CUSTOM_CHAT_TEMPLATE")
-                        self.has_chat_template = bool(self.tokenizer.chat_template) or bool(self.custom_chat_template)
-                        if self.custom_chat_template and isinstance(self.custom_chat_template, str):
+                        self.has_chat_template = hasattr(self.tokenizer, "chat_template") and bool(self.tokenizer.chat_template) or bool(self.custom_chat_template)
+                        if self.custom_chat_template:
                             self.tokenizer.chat_template = self.custom_chat_template
-                    
-                    def apply_chat_template(self, input):
-                        if isinstance(input, list):
-                            if not self.has_chat_template:
-                                raise ValueError(
-                                    "Chat template does not exist for this model, you must provide a single string input instead of a list of messages"
-                                )
-                        elif isinstance(input, str):
-                            input = [{"role": "user", "content": input}]
-                        else:
-                            raise ValueError("Input must be a string or a list of messages")
-                        
-                        return self.tokenizer.apply_chat_template(
-                            input, tokenize=False, add_generation_prompt=True
+                    def apply_chat_template(self, inp):
+                        if isinstance(inp, str):
+                            inp = [{"role":"user","content":inp}]
+                        return self.tokenizer.apply_chat_template(inp, tokenize=False, add_generation_prompt=True)
+                self.tokenizer_wrapper = MinimalWrapper(hf_tokenizer)
+            except Exception:
+                logger.warning("Could not initialize TokenizerWrapper or fallback. Chat-template features will be disabled.")
+                self.tokenizer_wrapper = None
+
+    async def generate(self, job_input: JobInput) -> AsyncGenerator[dict, None]:
+        """
+        job_input: JobInput wrapper
+        Yields dicts shaped like:
+         {"choices":[{"text": "..."}], "usage": {"input": N, "output": M}}
+        """
+        try:
+            # Determine prompt string
+            raw_input = job_input.messages if hasattr(job_input, "messages") else job_input.llm_input
+            apply_chat_template = getattr(job_input, "apply_chat_template", False)
+            if (apply_chat_template or isinstance(raw_input, list)) and self.tokenizer_wrapper:
+                try:
+                    prompt = self.tokenizer_wrapper.apply_chat_template(raw_input)
+                except Exception as e:
+                    # If tokenization template fails, fallback to simple concatenation
+                    logger.warning(f"apply_chat_template failed: {e}. Falling back to concatenation.")
+                    prompt = self._concat_messages(raw_input)
+            else:
+                prompt = self._concat_messages(raw_input)
+
+            # Chunking
+            chunks = split_text_into_chunks(prompt)
+            sampling = job_input.sampling_params if isinstance(job_input.sampling_params, dict) else {}
+            max_new_tokens = int(sampling.get("max_tokens", 200))
+            temperature = float(sampling.get("temperature", 1.0))
+            top_p = float(sampling.get("top_p", 0.95))
+            do_sample = sampling.get("do_sample", True)
+
+            total_input_tokens = 0  # rough metric (we do not compute tokens accurately here)
+            total_output_tokens = 0
+
+            # For each chunk, run blocking generate in threadpool
+            for i, chunk in enumerate(chunks):
+                logger.info(f"Generating chunk {i+1}/{len(chunks)} (words={len(chunk.split())})")
+                # Prepare inputs for model; some unsloth models accept tokenizer directly (we'll use model.tokenize path)
+                # We call generate in a thread to avoid blocking event loop
+                def blocking_gen(chunk_text):
+                    # Use tokenizer to create inputs if available
+                    try:
+                        inputs = self.tokenizer(chunk_text, return_tensors="pt", add_special_tokens=False).to(self.model.device)
+                        # Model.generate call
+                        out = self.model.generate(
+                            **inputs,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            do_sample=do_sample,
                         )
-                
-                return MinimalTokenizerWrapper(tokenizer)
-            except Exception as e:
-                logging.error(f"Failed to create fallback tokenizer: {e}")
-                raise e
+                        # out might be a tensor or sequences object; handle common cases
+                        try:
+                            if hasattr(out, "sequences"):
+                                seq = out.sequences[0]
+                            else:
+                                seq = out[0]
+                            text = self.tokenizer.decode(seq, skip_special_tokens=True)
+                        except Exception:
+                            # fallback: try model's text output if available
+                            text = str(out)
+                    except Exception as e:
+                        logger.exception("Synchronous generation error")
+                        text = f"[GEN_ERROR] {e}"
+                    return text
 
-    def dynamic_batch_size(self, current_batch_size, batch_size_growth_factor):
-        return min(current_batch_size*batch_size_growth_factor, self.default_batch_size)
-                           
-    async def generate(self, job_input: JobInput):
-        try:
-            async for batch in self._generate_vllm(
-                llm_input=job_input.llm_input,
-                validated_sampling_params=job_input.sampling_params,
-                batch_size=job_input.max_batch_size,
-                stream=job_input.stream,
-                apply_chat_template=job_input.apply_chat_template,
-                request_id=job_input.request_id,
-                batch_size_growth_factor=job_input.batch_size_growth_factor,
-                min_batch_size=job_input.min_batch_size
-            ):
+                generated_text = await asyncio.to_thread(blocking_gen, chunk)
+                total_output_tokens += len(generated_text.split())
+                # Build response batch (OpenAI-like)
+                batch = {
+                    "choices": [{"text": generated_text}],
+                    "usage": {
+                        "input": len(chunk.split()),  # word-level proxy
+                        "output": len(generated_text.split())
+                    },
+                    "chunk_index": i,
+                    "chunks_total": len(chunks)
+                }
                 yield batch
+
+            # final aggregate (optional)
+            logger.info(f"Generation complete. total_output_words={total_output_tokens}")
         except Exception as e:
-            yield {"error": create_error_response(str(e)).model_dump()}
+            logger.exception("Error in UnslothEngine.generate")
+            yield create_error_response(str(e))
 
-    async def _generate_vllm(self, llm_input, validated_sampling_params, batch_size, stream, apply_chat_template, request_id, batch_size_growth_factor, min_batch_size: str) -> AsyncGenerator[dict, None]:
-        if apply_chat_template or isinstance(llm_input, list):
-            tokenizer_wrapper = self._get_tokenizer_for_chat_template()
-            llm_input = tokenizer_wrapper.apply_chat_template(llm_input)
-        results_generator = self.llm.generate(llm_input, validated_sampling_params, request_id)
-        n_responses, n_input_tokens, is_first_output = validated_sampling_params.n, 0, True
-        last_output_texts, token_counters = ["" for _ in range(n_responses)], {"batch": 0, "total": 0}
-
-        batch = {
-            "choices": [{"tokens": []} for _ in range(n_responses)],
-        }
-        
-        max_batch_size = batch_size or self.default_batch_size
-        batch_size_growth_factor, min_batch_size = batch_size_growth_factor or self.batch_size_growth_factor, min_batch_size or self.min_batch_size
-        batch_size = BatchSize(max_batch_size, min_batch_size, batch_size_growth_factor)
-    
-
-        async for request_output in results_generator:
-            if is_first_output:  # Count input tokens only once
-                n_input_tokens = len(request_output.prompt_token_ids)
-                is_first_output = False
-
-            for output in request_output.outputs:
-                output_index = output.index
-                token_counters["total"] += 1
-                if stream:
-                    new_output = output.text[len(last_output_texts[output_index]):]
-                    batch["choices"][output_index]["tokens"].append(new_output)
-                    token_counters["batch"] += 1
-
-                    if token_counters["batch"] >= batch_size.current_batch_size:
-                        batch["usage"] = {
-                            "input": n_input_tokens,
-                            "output": token_counters["total"],
-                        }
-                        yield batch
-                        batch = {
-                            "choices": [{"tokens": []} for _ in range(n_responses)],
-                        }
-                        token_counters["batch"] = 0
-                        batch_size.update()
-
-                last_output_texts[output_index] = output.text
-
-        if not stream:
-            for output_index, output in enumerate(last_output_texts):
-                batch["choices"][output_index]["tokens"] = [output]
-            token_counters["batch"] += 1
-
-        if token_counters["batch"] > 0:
-            batch["usage"] = {"input": n_input_tokens, "output": token_counters["total"]}
-            yield batch
-
-    def _initialize_llm(self):
-        try:
-            start = time.time()
-            engine = AsyncLLMEngine.from_engine_args(self.engine_args)
-            end = time.time()
-            logging.info(f"Initialized vLLM engine in {end - start:.2f}s")
-            return engine
-        except Exception as e:
-            logging.error("Error initializing vLLM engine: %s", e)
-            raise e
-
-
-class OpenAIvLLMEngine(vLLMEngine):
-    def __init__(self, vllm_engine):
-        super().__init__(vllm_engine)
-        self.served_model_name = os.getenv("OPENAI_SERVED_MODEL_NAME_OVERRIDE") or self.engine_args.model
-        self.response_role = os.getenv("OPENAI_RESPONSE_ROLE") or "assistant"
-        self.lora_adapters = self._load_lora_adapters()
-        asyncio.run(self._initialize_engines())
-        # Handle both integer and boolean string values for RAW_OPENAI_OUTPUT
-        raw_output_env = os.getenv("RAW_OPENAI_OUTPUT", "1")
-        if raw_output_env.lower() in ('true', 'false'):
-            self.raw_openai_output = raw_output_env.lower() == 'true'
+    def _concat_messages(self, raw_input) -> str:
+        """
+        Convert either a single string prompt or a list of message dicts into a single prompt string.
+        """
+        if isinstance(raw_input, str):
+            return raw_input
+        elif isinstance(raw_input, list):
+            out = ""
+            for m in raw_input:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                out += f"[{role}]: {content}\n"
+            return out
         else:
-            self.raw_openai_output = bool(int(raw_output_env))
+            return str(raw_input)
 
-    def _load_lora_adapters(self):
-        adapters = []
-        try:
-            adapters = json.loads(os.getenv("LORA_MODULES", '[]'))
-        except Exception as e:
-            logging.info(f"---Initialized adapter json load error: {e}")
 
-        for i, adapter in enumerate(adapters):
-            try:
-                adapters[i] = LoRAModulePath(**adapter)
-                logging.info(f"---Initialized adapter: {adapter}")
-            except Exception as e:
-                logging.info(f"---Initialized adapter not worked: {e}")
-                continue
-        return adapters
+class OpenAIUnslothEngine(UnslothEngine):
+    """
+    Basic OpenAI-compatible wrapper. Supports:
+     - /v1/chat/completions (simple mapping to prompt)
+     - /v1/completions
+     - /v1/models (basic listing)
+    """
+    def __init__(self):
+        super().__init__()
+        self.served_model_name = os.getenv("OPENAI_SERVED_MODEL_NAME_OVERRIDE") or MODEL_NAME
+        # raw_openai_output determines whether to pass raw SSE strings (not used here) — accept bool
+        raw_output_env = os.getenv("RAW_OPENAI_OUTPUT", "0")
+        self.raw_openai_output = raw_output_env.lower() in ("1", "true", "yes")
 
-    async def _initialize_engines(self):
-        self.model_config = await self.llm.get_model_config()
-        self.base_model_paths = [
-            BaseModelPath(name=self.engine_args.model, model_path=self.engine_args.model)
-        ]
-
-        self.serving_models = OpenAIServingModels(
-            engine_client=self.llm,
-            model_config=self.model_config,
-            base_model_paths=self.base_model_paths,
-            lora_modules=self.lora_adapters,
-        )
-        await self.serving_models.init_static_loras()
-        
-        # Get chat template from vLLM tokenizer if available
-        chat_template = None
-        if self.tokenizer and hasattr(self.tokenizer, 'tokenizer'):
-            chat_template = self.tokenizer.tokenizer.chat_template
-        
-        self.chat_engine = OpenAIServingChat(
-            engine_client=self.llm, 
-            model_config=self.model_config,
-            models=self.serving_models,
-            response_role=self.response_role,
-            request_logger=None,
-            chat_template=chat_template,
-            chat_template_content_format="auto",
-            # enable_reasoning=os.getenv('ENABLE_REASONING', 'false').lower() == 'true',
-            reasoning_parser= os.getenv('REASONING_PARSER', "") or None,
-            # return_token_as_token_ids=False,
-            enable_auto_tools=os.getenv('ENABLE_AUTO_TOOL_CHOICE', 'false').lower() == 'true',
-            tool_parser=os.getenv('TOOL_CALL_PARSER', "") or None,
-            enable_prompt_tokens_details=False
-        )
-        self.completion_engine = OpenAIServingCompletion(
-            engine_client=self.llm, 
-            model_config=self.model_config,
-            models=self.serving_models,
-            request_logger=None,
-            # return_token_as_token_ids=False,
-        )
-    
-    async def generate(self, openai_request: JobInput):
-        if openai_request.openai_route == "/v1/models":
-            yield await self._handle_model_request()
-        elif openai_request.openai_route in ["/v1/chat/completions", "/v1/completions"]:
-            async for response in self._handle_chat_or_completion_request(openai_request):
-                yield response
-        else:
-            yield create_error_response("Invalid route").model_dump()
-    
-    async def _handle_model_request(self):
-        models = await self.serving_models.show_available_models()
-        return models.model_dump()
-    
-    async def _handle_chat_or_completion_request(self, openai_request: JobInput):
-        if openai_request.openai_route == "/v1/chat/completions":
-            request_class = ChatCompletionRequest
-            generator_function = self.chat_engine.create_chat_completion
-        elif openai_request.openai_route == "/v1/completions":
-            request_class = CompletionRequest
-            generator_function = self.completion_engine.create_completion
-        
-        try:
-            request = request_class(
-                **openai_request.openai_input
-            )
-        except Exception as e:
-            yield create_error_response(str(e)).model_dump()
+    async def generate(self, openai_request: JobInput) -> AsyncGenerator[dict, None]:
+        # If the caller requested model listing
+        if getattr(openai_request, "openai_route", None) == "/v1/models":
+            # a minimal models response
+            yield {"data": [{"id": self.served_model_name, "object": "model"}]}
             return
-        
-        dummy_request = DummyRequest()
-        response_generator = await generator_function(request, raw_request=dummy_request)
 
-        if not openai_request.openai_input.get("stream") or isinstance(response_generator, ErrorResponse):
-            yield response_generator.model_dump()
+        # For compeletion/chat endpoints, transform openai_input to prompt/messages
+        openai_input = getattr(openai_request, "openai_input", None) or {}
+        route = getattr(openai_request, "openai_route", None)
+        if route in ("/v1/chat/completions", "/v1/completions"):
+            # If messages provided (chat style), use them
+            if "messages" in openai_input:
+                job = {
+                    "messages": openai_input["messages"],
+                    "sampling_params": {
+                        "max_tokens": openai_input.get("max_tokens", 200),
+                        "temperature": openai_input.get("temperature", 1.0),
+                        "top_p": openai_input.get("top_p", 0.95),
+                        "do_sample": openai_input.get("do_sample", True),
+                    },
+                    "stream": openai_input.get("stream", False),
+                    "apply_chat_template": True,
+                }
+            else:
+                # text completion style (prompt)
+                job = {
+                    "messages": openai_input.get("prompt", openai_input.get("input", "")),
+                    "sampling_params": {
+                        "max_tokens": openai_input.get("max_tokens", 200),
+                        "temperature": openai_input.get("temperature", 1.0),
+                        "top_p": openai_input.get("top_p", 0.95),
+                        "do_sample": openai_input.get("do_sample", True),
+                    },
+                    "stream": openai_input.get("stream", False),
+                    "apply_chat_template": False,
+                }
+
+            wrapped_job = JobInput(job)
+            # Reuse UnslothEngine generate to produce chunks
+            async for out in super().generate(wrapped_job):
+                # For OpenAI-compat, reformat into choices array
+                if "choices" in out and isinstance(out["choices"], list):
+                    # convert to a simpler openai-like output
+                    text = out["choices"][0].get("text", "")
+                    yield {"choices": [{"text": text}], "usage": out.get("usage", {})}
+                else:
+                    yield out
         else:
-            batch = []
-            batch_token_counter = 0
-            batch_size = BatchSize(self.default_batch_size, self.min_batch_size, self.batch_size_growth_factor)
-        
-            async for chunk_str in response_generator:
-                if "data" in chunk_str:
-                    if self.raw_openai_output:
-                        data = chunk_str
-                    elif "[DONE]" in chunk_str:
-                        continue
-                    else:
-                        data = json.loads(chunk_str.removeprefix("data: ").rstrip("\n\n")) if not self.raw_openai_output else chunk_str
-                    batch.append(data)
-                    batch_token_counter += 1
-                    if batch_token_counter >= batch_size.current_batch_size:
-                        if self.raw_openai_output:
-                            batch = "".join(batch)
-                        yield batch
-                        batch = []
-                        batch_token_counter = 0
-                        batch_size.update()
-            if batch:
-                if self.raw_openai_output:
-                    batch = "".join(batch)
-                yield batch
-            
+            yield create_error_response("Invalid OpenAI route: " + str(route))
+
+
+# Singletons for importers
+UNSLOTH_ENGINE = UnslothEngine()
+OPENAI_UNSLOTH_ENGINE = OpenAIUnslothEngine()
