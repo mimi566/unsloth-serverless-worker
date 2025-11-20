@@ -11,13 +11,13 @@ MODEL_PATTERNS = ["*.safetensors", "*.bin", "*.pt"]
 
 logging.basicConfig(level=logging.INFO)
 
-# Simple timer decorator (replaces missing utils.timer_decorator)
+# Simple timer decorator directly in this file
 def timer_decorator(func):
     def wrapper(*args, **kwargs):
         start = time.time()
         result = func(*args, **kwargs)
         end = time.time()
-        logging.info(f"{func.__name__} executed in {end-start:.2f} seconds")
+        logging.info(f"{func.__name__} completed in {end - start:.2f}s")
         return result
     return wrapper
 
@@ -55,7 +55,9 @@ def download(name, revision, type, cache_dir):
 
 if __name__ == "__main__":
     setup_env()
-    cache_dir = os.getenv("HF_HOME")
+    cache_dir = os.getenv("HF_HOME", "/tmp/hf_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
     model_name = os.getenv("MODEL_NAME")
     model_revision = os.getenv("MODEL_REVISION") or None
     tokenizer_name = os.getenv("TOKENIZER_NAME") or model_name
