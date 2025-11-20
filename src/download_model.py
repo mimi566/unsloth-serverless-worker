@@ -4,14 +4,34 @@ import json
 import logging
 import glob
 from huggingface_hub import snapshot_download
-from utils import timer_decorator
+import time
+import functools
 
-BASE_DIR = "/" 
+# ----------------------------
+# Timer decorator (self-contained)
+# ----------------------------
+def timer_decorator(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        end = time.time()
+        logging.info(f"{func.__name__} took {end - start:.2f} seconds")
+        return result
+    return wrapper
+
+# ----------------------------
+# Constants
+# ----------------------------
+BASE_DIR = "/"
 TOKENIZER_PATTERNS = ["tokenizer.json", "tokenizer*"]
 MODEL_PATTERNS = ["*.safetensors", "*.bin", "*.pt"]
 
 logging.basicConfig(level=logging.INFO)
 
+# ----------------------------
+# Environment setup for testing
+# ----------------------------
 def setup_env():
     if os.getenv("TESTING_DOWNLOAD") == "1":
         global BASE_DIR
@@ -22,7 +42,11 @@ def setup_env():
             "MODEL_NAME": "openchat/openchat-3.5-0106",
             "HF_HUB_ENABLE_HF_TRANSFER": "1"
         })
+        logging.info(f"Test environment setup with HF cache at {os.environ['HF_HOME']}")
 
+# ----------------------------
+# Download function
+# ----------------------------
 @timer_decorator
 def download(name, revision, type, cache_dir):
     if type == "model":
@@ -34,9 +58,9 @@ def download(name, revision, type, cache_dir):
 
     try:
         path = snapshot_download(
-            repo_id=name, 
-            revision=revision, 
-            cache_dir=cache_dir, 
+            repo_id=name,
+            revision=revision,
+            cache_dir=cache_dir,
             allow_patterns=patterns
         )
         logging.info(f"Downloaded {type} from {name} to {path}")
@@ -44,6 +68,9 @@ def download(name, revision, type, cache_dir):
     except Exception as e:
         raise ValueError(f"Failed to download {type} from {name}: {e}")
 
+# ----------------------------
+# Main block for CLI / Colab
+# ----------------------------
 if __name__ == "__main__":
     setup_env()
     cache_dir = os.getenv("HF_HOME")
@@ -52,9 +79,11 @@ if __name__ == "__main__":
     tokenizer_name = os.getenv("TOKENIZER_NAME") or model_name
     tokenizer_revision = os.getenv("TOKENIZER_REVISION") or model_revision
 
+    # Download model and tokenizer
     model_path = download(model_name, model_revision, "model", cache_dir)
     tokenizer_path = download(tokenizer_name, tokenizer_revision, "tokenizer", cache_dir)
 
+    # Save metadata
     metadata = {
         "MODEL_NAME": model_path,
         "MODEL_REVISION": model_revision,
