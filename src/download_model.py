@@ -6,12 +6,12 @@ from huggingface_hub import snapshot_download
 import time
 
 BASE_DIR = "/" 
-TOKENIZER_PATTERNS = ["tokenizer.json", "tokenizer*"]
-MODEL_PATTERNS = ["*.safetensors", "*.bin", "*.pt"]
+TOKENIZER_PATTERNS = ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]
+MODEL_PATTERNS = ["*.safetensors", "*.bin", "*.pt", "config.json", "generation_config.json", "special_tokens_map.json", "*.jinja"]
 
 logging.basicConfig(level=logging.INFO)
 
-# Simple timer decorator directly in this file
+# Timer decorator
 def timer_decorator(func):
     def wrapper(*args, **kwargs):
         start = time.time()
@@ -22,6 +22,7 @@ def timer_decorator(func):
     return wrapper
 
 def setup_env():
+    """Set environment for testing."""
     if os.getenv("TESTING_DOWNLOAD") == "1":
         global BASE_DIR
         BASE_DIR = "tmp"
@@ -34,6 +35,7 @@ def setup_env():
 
 @timer_decorator
 def download(name, revision, type, cache_dir):
+    """Download model or tokenizer from Hugging Face Hub."""
     if type == "model":
         patterns = MODEL_PATTERNS
     elif type == "tokenizer":
@@ -43,10 +45,11 @@ def download(name, revision, type, cache_dir):
 
     try:
         path = snapshot_download(
-            repo_id=name, 
-            revision=revision, 
-            cache_dir=cache_dir, 
-            allow_patterns=patterns
+            repo_id=name,
+            revision=revision,
+            cache_dir=cache_dir,
+            allow_patterns=patterns,
+            local_files_only=False
         )
         logging.info(f"Downloaded {type} from {name} to {path}")
         return path
@@ -63,9 +66,13 @@ if __name__ == "__main__":
     tokenizer_name = os.getenv("TOKENIZER_NAME") or model_name
     tokenizer_revision = os.getenv("TOKENIZER_REVISION") or model_revision
 
+    # Download model (includes weights + config + templates)
     model_path = download(model_name, model_revision, "model", cache_dir)
+
+    # Download tokenizer
     tokenizer_path = download(tokenizer_name, tokenizer_revision, "tokenizer", cache_dir)
 
+    # Save metadata for FastLanguageModel
     metadata = {
         "MODEL_NAME": model_path,
         "MODEL_REVISION": model_revision,
